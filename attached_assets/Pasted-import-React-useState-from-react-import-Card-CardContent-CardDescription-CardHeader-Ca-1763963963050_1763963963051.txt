@@ -1,0 +1,411 @@
+import React, { useState } from 'react';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Button } from "@/components/ui/button";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Download, FileText, Loader2, CheckCircle2, AlertCircle } from 'lucide-react';
+
+export default function Home() {
+    const [apiToken, setApiToken] = useState('');
+    const [organizationId, setOrganizationId] = useState('');
+    const [projectId, setProjectId] = useState('');
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState('');
+    const [success, setSuccess] = useState('');
+    const [taskCount, setTaskCount] = useState(null);
+    const [logs, setLogs] = useState([]);
+
+    const addLog = (message, type = 'info') => {
+        const timestamp = new Date().toLocaleTimeString();
+        setLogs(prev => [...prev, { timestamp, message, type }]);
+        console.log(`[${timestamp}] ${message}`);
+    };
+
+    const fetchAllPages = async (url, headers, pageSize = 200, resourceType = 'items') => {
+        let allData = [];
+        let currentPage = 1;
+        let totalPages = 1;
+
+        while (currentPage <= totalPages) {
+            const separator = url.includes('?') ? '&' : '?';
+            const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(`${url}${separator}page[number]=${currentPage}&page[size]=${pageSize}`)}`;
+            
+            let retries = 3;
+            let response;
+            
+            while (retries > 0) {
+                try {
+                    response = await fetch(proxyUrl, { headers });
+                    if (response.ok) break;
+                    
+                    addLog(`Retry fetching ${resourceType} page ${currentPage} (${retries} retries left)`, 'warning');
+                    retries--;
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                } catch (err) {
+                    addLog(`Error fetching ${resourceType} page ${currentPage}: ${err.message}`, 'error');
+                    retries--;
+                    if (retries === 0) throw err;
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            }
+
+            if (!response.ok) {
+                const text = await response.text();
+                throw new Error(`API Error: ${response.status} ${response.statusText} - ${text}`);
+            }
+
+            const data = await response.json();
+            const pageData = data.data || [];
+            allData = allData.concat(pageData);
+            totalPages = data.meta?.total_pages || 1;
+            
+            addLog(`Fetched ${resourceType} page ${currentPage}/${totalPages} (${pageData.length} items, ${allData.length} total)`, 'info');
+            
+            currentPage++;
+
+            // Rate limiting: delay between requests
+            if (currentPage <= totalPages) {
+                await new Promise(resolve => setTimeout(resolve, 300));
+            }
+        }
+
+        return allData;
+    };
+
+    const fetchTaskComments = async (taskId, headers) => {
+        try {
+            addLog(`Fetching comments for task ${taskId}...`, 'info');
+            const baseUrl = `https://api.productive.io/api/v2/comments?filter[task_id]=${taskId}`;
+            
+            // Use smaller page size for comments (50 instead of 200)
+            const comments = await fetchAllPages(baseUrl, headers, 50, `comments for task ${taskId}`);
+            
+            addLog(`Found ${comments.length} comments for task ${taskId}`, comments.length > 0 ? 'success' : 'info');
+
+            if (comments.length === 0) {
+                return '';
+            }
+
+            return comments.map(comment => {
+                const timestamp = comment.attributes?.updated_at || comment.attributes?.created_at || '';
+                const body = comment.attributes?.body || '';
+                const creator = comment.relationships?.creator?.data?.id || '';
+                return `[${timestamp}] ${body}`;
+            }).join(' | ');
+        } catch (err) {
+            addLog(`Error fetching comments for task ${taskId}: ${err.message}`, 'error');
+            return '';
+        }
+    };
+
+    const getRelationshipName = (included, type, id) => {
+        if (!included || !id) return '';
+        const item = included.find(i => i.type === type && i.id === id);
+        return item?.attributes?.name || item?.attributes?.title || '';
+    };
+
+    const handleExport = async () => {
+        if (!apiToken || !organizationId || !projectId) {
+            setError('Please fill in all fields');
+            return;
+        }
+
+        setLoading(true);
+        setError('');
+        setSuccess('');
+        setTaskCount(null);
+        setLogs([]);
+
+        try {
+            addLog('Starting export process...', 'info');
+            const headers = {
+                'X-Auth-Token': apiToken,
+                'X-Organization-Id': organizationId,
+                'Content-Type': 'application/vnd.api+json'
+            };
+
+            // Fetch tasks with related data
+            addLog(`Fetching tasks for project ${projectId}...`, 'info');
+            const tasks = await fetchAllPages(
+                `https://api.productive.io/api/v2/tasks?filter[project_id]=${projectId}&include=assignee,creator,last_actor,task_list,parent_task,workflow_status`,
+                headers,
+                200,
+                'tasks'
+            );
+
+            setTaskCount(tasks.length);
+            addLog(`Total tasks found: ${tasks.length}`, 'success');
+
+            if (tasks.length === 0) {
+                addLog('No tasks found for this project', 'error');
+                setError('No tasks found for this project');
+                setLoading(false);
+                return;
+            }
+
+            // Fetch comments for each task
+            addLog('Starting to fetch comments for all tasks...', 'info');
+            const tasksWithComments = [];
+            
+            for (let i = 0; i < tasks.length; i++) {
+                const task = tasks[i];
+                addLog(`Processing task ${i + 1}/${tasks.length}: "${task.attributes?.title}" (ID: ${task.id})`, 'info');
+                
+                const comments = await fetchTaskComments(task.id, headers);
+                tasksWithComments.push({ ...task, comments });
+
+                // Longer delay between tasks to avoid rate limiting
+                if (i < tasks.length - 1) {
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                }
+            }
+            
+            addLog('Finished fetching all comments!', 'success');
+
+            // Generate CSV
+            addLog('Generating CSV file...', 'info');
+            const csvContent = generateCSV(tasksWithComments);
+
+            // Download CSV
+            addLog('Download ready!', 'success');
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            const url = URL.createObjectURL(blob);
+            link.setAttribute('href', url);
+            link.setAttribute('download', `productive_tasks_project_${projectId}_${new Date().toISOString().split('T')[0]}.csv`);
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+
+            setSuccess(`Successfully exported ${tasks.length} tasks with comments!`);
+        } catch (err) {
+            console.error('Export error:', err);
+            setError(err.message || 'Failed to export tasks. Please check your credentials and try again.');
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const generateCSV = (tasks) => {
+        const headers = [
+            'Title', 'Task list', 'Status', 'Due date', 'Assignee', 'Last activity',
+            'Creator', 'Date', 'Date closed', 'Date created', 'Dependencies',
+            'Deployment Approved', 'Description', 'Due date & time', 'ID', 'Last actor',
+            'Overdue', 'Parent task', 'Priority', 'Pull Request', 'Pull Request Approved',
+            'Repeat schedule', 'Start date', 'Status', 'Status category', 'Subtask',
+            'Tags', 'Task number', 'Task privacy', 'To-dos', 'Type', 'Comments'
+        ];
+
+        const escapeCSV = (value) => {
+            if (value === null || value === undefined) return '';
+            const stringValue = String(value);
+            if (stringValue.includes(',') || stringValue.includes('"') || stringValue.includes('\n')) {
+                return `"${stringValue.replace(/"/g, '""')}"`;
+            }
+            return stringValue;
+        };
+
+        const rows = tasks.map(task => {
+            const attrs = task.attributes || {};
+            const rels = task.relationships || {};
+
+            return [
+                escapeCSV(attrs.title),
+                escapeCSV(rels.task_list?.data?.id || ''),
+                escapeCSV(attrs.closed ? 'Closed' : 'Open'),
+                escapeCSV(attrs.due_date),
+                escapeCSV(rels.assignee?.data?.id || ''),
+                escapeCSV(attrs.last_activity_at),
+                escapeCSV(rels.creator?.data?.id || ''),
+                escapeCSV(attrs.updated_at),
+                escapeCSV(attrs.closed_at),
+                escapeCSV(attrs.created_at),
+                escapeCSV(attrs.task_dependency_count || 0),
+                escapeCSV(''),
+                escapeCSV(attrs.description),
+                escapeCSV(attrs.due_time ? `${attrs.due_date} ${attrs.due_time}` : attrs.due_date),
+                escapeCSV(task.id),
+                escapeCSV(rels.last_actor?.data?.id || ''),
+                escapeCSV(attrs.closed ? 'No' : (attrs.due_date && new Date(attrs.due_date) < new Date() ? 'Yes' : 'No')),
+                escapeCSV(rels.parent_task?.data?.id || ''),
+                escapeCSV(''),
+                escapeCSV(''),
+                escapeCSV(''),
+                escapeCSV(attrs.repeat_schedule_id || ''),
+                escapeCSV(attrs.start_date),
+                escapeCSV(attrs.closed ? 'Closed' : 'Open'),
+                escapeCSV(rels.workflow_status?.data?.id || ''),
+                escapeCSV(attrs.subtask_count || 0),
+                escapeCSV(Array.isArray(attrs.tag_list) ? attrs.tag_list.join('; ') : ''),
+                escapeCSV(attrs.task_number),
+                escapeCSV(attrs.private ? 'Private' : 'Public'),
+                escapeCSV(`${attrs.open_todo_count || 0}/${attrs.todo_count || 0}`),
+                escapeCSV(attrs.type_id === 1 ? 'Task' : 'Milestone'),
+                escapeCSV(task.comments)
+            ].join(',');
+        });
+
+        return [headers.join(','), ...rows].join('\n');
+    };
+
+    return (
+        <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50 to-slate-100 py-12 px-4">
+            <div className="max-w-2xl mx-auto space-y-8">
+                {/* Header */}
+                <div className="text-center space-y-3">
+                    <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-gradient-to-br from-slate-700 to-slate-900 shadow-lg mb-4">
+                        <FileText className="w-8 h-8 text-white" />
+                    </div>
+                    <h1 className="text-4xl font-bold text-slate-900 tracking-tight">
+                        Productive Task Exporter
+                    </h1>
+                    <p className="text-lg text-slate-600">
+                        Export your project tasks with comments to CSV
+                    </p>
+                </div>
+
+                {/* Main Card */}
+                <Card className="shadow-xl border-slate-200/50 bg-white/80 backdrop-blur">
+                    <CardHeader className="space-y-2 pb-6">
+                        <CardTitle className="text-2xl text-slate-900">Export Configuration</CardTitle>
+                        <CardDescription className="text-base text-slate-600">
+                            Enter your Productive API credentials and project details
+                        </CardDescription>
+                    </CardHeader>
+                    <CardContent className="space-y-6">
+                        <div className="space-y-4">
+                            <div className="space-y-2">
+                                <Label htmlFor="apiToken" className="text-sm font-medium text-slate-700">
+                                    API Token
+                                </Label>
+                                <Input
+                                    id="apiToken"
+                                    type="password"
+                                    placeholder="Your read-only API token"
+                                    value={apiToken}
+                                    onChange={(e) => setApiToken(e.target.value)}
+                                    className="h-11 border-slate-300 focus:border-slate-500 focus:ring-slate-500"
+                                />
+                                <p className="text-xs text-slate-500">
+                                    Generate from Settings → API integrations in Productive
+                                </p>
+                            </div>
+
+                            <div className="space-y-2">
+                                <Label htmlFor="organizationId" className="text-sm font-medium text-slate-700">
+                                    Organization ID
+                                </Label>
+                                <Input
+                                    id="organizationId"
+                                    type="text"
+                                    placeholder="Your organization ID"
+                                    value={organizationId}
+                                    onChange={(e) => setOrganizationId(e.target.value)}
+                                    className="h-11 border-slate-300 focus:border-slate-500 focus:ring-slate-500"
+                                />
+                            </div>
+
+                            <div className="space-y-2">
+                                <Label htmlFor="projectId" className="text-sm font-medium text-slate-700">
+                                    Project ID
+                                </Label>
+                                <Input
+                                    id="projectId"
+                                    type="text"
+                                    placeholder="Project ID to export"
+                                    value={projectId}
+                                    onChange={(e) => setProjectId(e.target.value)}
+                                    className="h-11 border-slate-300 focus:border-slate-500 focus:ring-slate-500"
+                                />
+                            </div>
+                        </div>
+
+                        {error && (
+                            <Alert className="border-red-200 bg-red-50">
+                                <AlertCircle className="h-4 w-4 text-red-600" />
+                                <AlertDescription className="text-red-800">
+                                    {error}
+                                </AlertDescription>
+                            </Alert>
+                        )}
+
+                        {success && (
+                            <Alert className="border-green-200 bg-green-50">
+                                <CheckCircle2 className="h-4 w-4 text-green-600" />
+                                <AlertDescription className="text-green-800">
+                                    {success}
+                                </AlertDescription>
+                            </Alert>
+                        )}
+
+                        <Button
+                            onClick={handleExport}
+                            disabled={loading}
+                            className="w-full h-12 bg-gradient-to-r from-slate-700 to-slate-900 hover:from-slate-800 hover:to-black text-white font-medium text-base shadow-lg hover:shadow-xl transition-all"
+                        >
+                            {loading ? (
+                                <>
+                                    <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                                    {taskCount !== null ? `Processing ${taskCount} tasks...` : 'Fetching tasks...'}
+                                </>
+                            ) : (
+                                <>
+                                    <Download className="mr-2 h-5 w-5" />
+                                    Export to CSV
+                                </>
+                            )}
+                        </Button>
+
+                        {loading && logs.length > 0 && (
+                            <div className="space-y-2 p-4 bg-slate-50 rounded-lg border border-slate-200">
+                                <h4 className="text-sm font-semibold text-slate-700 mb-2">Progress Log:</h4>
+                                <div className="max-h-64 overflow-y-auto space-y-1 font-mono text-xs">
+                                    {logs.map((log, idx) => (
+                                        <div 
+                                            key={idx} 
+                                            className={`${
+                                                log.type === 'error' ? 'text-red-600' :
+                                                log.type === 'warning' ? 'text-yellow-600' :
+                                                log.type === 'success' ? 'text-green-600' :
+                                                'text-slate-600'
+                                            }`}
+                                        >
+                                            <span className="text-slate-400">[{log.timestamp}]</span> {log.message}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+                    </CardContent>
+                </Card>
+
+                {/* Info Card */}
+                <Card className="border-slate-200/50 bg-white/60 backdrop-blur">
+                    <CardContent className="pt-6">
+                        <h3 className="font-semibold text-slate-900 mb-3">Export Includes:</h3>
+                        <ul className="text-sm text-slate-600 space-y-2">
+                            <li className="flex items-start">
+                                <span className="text-green-600 mr-2">✓</span>
+                                All 31 task fields including metadata and relationships
+                            </li>
+                            <li className="flex items-start">
+                                <span className="text-green-600 mr-2">✓</span>
+                                Complete comment history with timestamps
+                            </li>
+                            <li className="flex items-start">
+                                <span className="text-green-600 mr-2">✓</span>
+                                Automatic pagination handling for large projects
+                            </li>
+                            <li className="flex items-start">
+                                <span className="text-green-600 mr-2">✓</span>
+                                Rate limit compliance built-in
+                            </li>
+                        </ul>
+                    </CardContent>
+                </Card>
+            </div>
+        </div>
+    );
+}
