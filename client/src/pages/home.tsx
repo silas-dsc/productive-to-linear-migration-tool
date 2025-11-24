@@ -58,22 +58,40 @@ export default function Home() {
       const separator = url.includes('?') ? '&' : '?';
       const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(`${url}${separator}page[number]=${currentPage}&page[size]=${pageSize}`)}`;
       
-      let retries = 3;
+      let retries = 5;
       let response: Response | undefined;
+      let attempt = 0;
       
       while (retries > 0) {
         try {
           response = await fetch(proxyUrl, { headers });
+          
+          // Success - break out
           if (response.ok) break;
           
-          addLog(`Retry fetching ${resourceType} page ${currentPage} (${retries} retries left)`, 'warning');
+          // Rate limit - use longer backoff
+          if (response.status === 429) {
+            const backoffDelay = Math.min(5000 * Math.pow(2, attempt), 30000);
+            addLog(`Rate limited on ${resourceType} page ${currentPage}, waiting ${(backoffDelay / 1000).toFixed(1)}s...`, 'warning');
+            await new Promise(resolve => setTimeout(resolve, backoffDelay));
+            retries--;
+            attempt++;
+            continue;
+          }
+          
+          // Other error - use exponential backoff
+          const backoffDelay = Math.min(1000 * Math.pow(2, attempt), 10000);
+          addLog(`Retry fetching ${resourceType} page ${currentPage} (${retries} retries left, waiting ${(backoffDelay / 1000).toFixed(1)}s)`, 'warning');
           retries--;
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          attempt++;
+          await new Promise(resolve => setTimeout(resolve, backoffDelay));
         } catch (err: any) {
-          addLog(`Error fetching ${resourceType} page ${currentPage}: ${err.message}`, 'error');
+          const backoffDelay = Math.min(1000 * Math.pow(2, attempt), 10000);
+          addLog(`Network error fetching ${resourceType} page ${currentPage}: ${err.message} (${retries} retries left)`, 'error');
           retries--;
+          attempt++;
           if (retries === 0) throw err;
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          await new Promise(resolve => setTimeout(resolve, backoffDelay));
         }
       }
 
@@ -92,7 +110,7 @@ export default function Home() {
       currentPage++;
 
       if (currentPage <= totalPages) {
-        await new Promise(resolve => setTimeout(resolve, 200));
+        await new Promise(resolve => setTimeout(resolve, 300));
       }
     }
 
@@ -126,7 +144,7 @@ export default function Home() {
   const fetchTaskCommentsInParallel = async (
     tasks: any[],
     headers: Record<string, string>,
-    concurrency = 8
+    concurrency = 5
   ) => {
     addLog(`Starting parallel comment fetching with ${concurrency} concurrent requests...`, 'info');
     
@@ -155,7 +173,7 @@ export default function Home() {
       addLog(`Progress: ${tasksWithComments.length}/${tasks.length} tasks processed (${percentComplete}%)`, 'success');
       
       if (i + concurrency < tasks.length) {
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await new Promise(resolve => setTimeout(resolve, 300));
       }
     }
     
@@ -210,8 +228,8 @@ export default function Home() {
         return;
       }
 
-      addLog(`Fetching comments using parallel processing (8 concurrent requests)...`, 'info');
-      const tasksWithComments = await fetchTaskCommentsInParallel(tasks, headers, 8);
+      addLog(`Fetching comments using parallel processing (5 concurrent requests)...`, 'info');
+      const tasksWithComments = await fetchTaskCommentsInParallel(tasks, headers, 5);
       
       const elapsedTime = ((Date.now() - startTimeRef.current) / 1000).toFixed(1);
       addLog(`Finished fetching all comments in ${elapsedTime}s!`, 'success');
