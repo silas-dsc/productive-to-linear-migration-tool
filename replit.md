@@ -2,7 +2,7 @@
 
 ## Overview
 
-This is a high-performance web application designed to export tasks and comments from Productive.io projects to CSV format. The application uses optimized parallel processing to achieve 3-5x faster performance compared to traditional sequential approaches. Built with React on the frontend and Express on the backend, it provides real-time progress tracking and comprehensive logging during the export process.
+This is a high-performance web application designed to export tasks and comments from Productive.io projects to CSV format. The application uses server-side processing with a 120-second error cooldown policy to ensure reliable data fetching from the Productive.io API. Built with React on the frontend and Express on the backend, it provides real-time progress tracking via Server-Sent Events (SSE) and comprehensive logging during the export process.
 
 ## User Preferences
 
@@ -25,16 +25,16 @@ Preferred communication style: Simple, everyday language.
 - Component organization under `client/src/components/ui/` with path aliases (`@/components`)
 
 **State Management & Data Fetching**
-- TanStack React Query for server state management and caching
 - Local React state (useState) for form inputs and UI state
-- Real-time progress tracking with in-memory state updates
-- No backend database integration - all API calls are made directly from the client to Productive.io
+- Server-Sent Events (EventSource) for real-time progress updates from backend
+- All Productive.io API calls handled server-side
+- No client-side data fetching or CSV generation
 
 **Key Design Decisions**
-- Client-side CSV generation to reduce server load and enable offline processing
-- Parallel request batching for high-performance data fetching
-- Real-time log streaming with auto-scroll behavior for user feedback
-- Password inputs for API tokens to maintain security
+- Server-side processing enables long-running tasks without browser timeouts
+- EventSource/SSE provides real-time progress streaming without polling overhead
+- 120-second global cooldown on any API error ensures reliable operation
+- Password inputs for API tokens to maintain security (credentials never stored)
 
 ### Backend Architecture
 
@@ -42,35 +42,42 @@ Preferred communication style: Simple, everyday language.
 - Express.js with TypeScript for type-safe server code
 - Development mode using tsx with Vite middleware for hot module replacement
 - Production mode serving pre-built static assets from `dist/public`
-- HTTP-only server (no WebSocket connections)
+- Server-Sent Events (SSE) for real-time progress streaming
 
 **Application Structure**
-- Minimal backend footprint - primarily serves as a static file host
-- Routes defined in `server/routes.ts` (currently minimal, prefixed with `/api`)
-- In-memory storage interface (`MemStorage`) for potential future user management
+- Export job orchestration via `server/export-worker.ts`
+- Productive.io API client with 120-second error cooldown in `server/export-worker.ts`
+- In-memory job storage via `server/job-storage.ts` (no database required)
+- RESTful API routes in `server/routes.ts`:
+  - POST /api/export - Start export job, returns jobId
+  - GET /api/export/:jobId/stream - SSE endpoint for real-time updates
+  - GET /api/export/:jobId/status - Polling fallback endpoint
+  - GET /api/export/:jobId/download - Download completed CSV
 - Separate entry points for development (`index-dev.ts`) and production (`index-prod.ts`)
 
 **Key Design Decisions**
-- Backend serves mainly as infrastructure for frontend delivery
-- All Productive.io API interactions happen client-side via CORS proxy
-- Raw body parsing enabled for potential webhook integrations
-- Request/response logging with timing information for debugging
+- Server-side API orchestration eliminates CORS issues and browser timeout constraints
+- Global 120-second cooldown on ANY Productive.io API error (replaces exponential backoff)
+- SSE provides efficient real-time updates without polling
+- Job cleanup runs every 10 minutes to remove jobs older than 1 hour
+- Parallel comment fetching (5 concurrent requests) with 300ms delays between batches
+- CSV generation happens server-side and is cached until download
 
 ### Data Storage Solutions
 
 **Current State**
-- No persistent database in active use
-- In-memory storage interface defined but not actively utilized
+- In-memory job storage for active export jobs (auto-cleanup after 1 hour)
+- No persistent database required or used
 - User schema defined with Drizzle ORM but not implemented in application logic
 
 **Database Configuration**
 - Drizzle ORM configured for PostgreSQL with Neon Database serverless driver
-- Schema defined in `shared/schema.ts` with user table structure
+- Schema defined in `shared/schema.ts` with user table and export job types
 - Migration system configured to output to `./migrations` directory
 - Database credentials expected via `DATABASE_URL` environment variable
 
 **Key Design Decisions**
-- Application currently operates without persistent storage
+- In-memory job storage sufficient for transient export tasks
 - Database infrastructure prepared for future authentication/user management features
 - Drizzle chosen for type-safe database operations and automatic schema migrations
 
@@ -78,8 +85,10 @@ Preferred communication style: Simple, everyday language.
 
 **Third-Party APIs**
 - Productive.io REST API for fetching tasks, comments, and project data
-- CORS proxy (corsproxy.io) used to bypass browser CORS restrictions when accessing Productive.io API
-- Retry logic with exponential backoff for handling API rate limits and transient failures
+- Direct server-to-API communication (no CORS proxy needed)
+- 120-second global cooldown on ANY API error
+- 5 retries with exponential backoff (1s→2s→4s→8s→10s) before triggering cooldown
+- Special rate limit handling (429 errors) with aggressive backoff (5s→10s→20s→30s)
 
 **UI & Component Libraries**
 - shadcn/ui (complete component collection installed)
@@ -98,7 +107,23 @@ Preferred communication style: Simple, everyday language.
 - API tokens managed client-side via form inputs
 
 **Key Design Decisions**
-- CORS proxy enables direct client-to-API communication without backend proxying
+- Server-side API calls eliminate CORS issues entirely
 - Heavy reliance on Radix UI ensures accessibility compliance out of the box
 - Comprehensive shadcn/ui installation provides design consistency across all components
 - Development tooling optimized for Replit environment
+
+## Recent Changes (November 24, 2025)
+
+**Major Architectural Overhaul: Client-Side → Server-Side Processing**
+
+- Moved all Productive.io API calls from client to backend Express server
+- Implemented 120-second global error cooldown (replaces exponential backoff strategy)
+- Added Server-Sent Events (SSE) for real-time progress streaming to frontend
+- Created export job orchestration system with in-memory storage
+- Backend modules:
+  - `server/export-worker.ts` - Productive API client with cooldown logic and CSV generation
+  - `server/job-storage.ts` - In-memory job storage with auto-cleanup
+  - `server/routes.ts` - RESTful API endpoints for job management
+- Frontend simplified to use EventSource for SSE connection
+- Removed CORS proxy dependency (corsproxy.io)
+- Benefits: No browser timeouts, centralized error handling, better reliability

@@ -6,20 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Progress } from "@/components/ui/progress";
 import { Download, FileText, Loader2, CheckCircle2, AlertCircle, Zap, Activity } from 'lucide-react';
-
-interface LogEntry {
-  timestamp: string;
-  message: string;
-  type: 'info' | 'success' | 'warning' | 'error';
-}
-
-interface ProgressStats {
-  tasksProcessed: number;
-  totalTasks: number;
-  commentsProcessed: number;
-  activeRequests: number;
-  startTime: number;
-}
+import type { LogEntry, ProgressStats } from '@shared/schema';
 
 export default function Home() {
   const [apiToken, setApiToken] = useState('');
@@ -36,149 +23,25 @@ export default function Home() {
     activeRequests: 0,
     startTime: 0,
   });
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [jobStatus, setJobStatus] = useState<string>('');
   
   const logsEndRef = useRef<HTMLDivElement>(null);
   const startTimeRef = useRef<number>(0);
+  const eventSourceRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
-  const addLog = (message: string, type: LogEntry['type'] = 'info') => {
-    const timestamp = new Date().toLocaleTimeString();
-    setLogs(prev => [...prev, { timestamp, message, type }]);
-  };
-
-  const fetchAllPages = async (url: string, headers: Record<string, string>, pageSize = 200, resourceType = 'items') => {
-    let allData: any[] = [];
-    let currentPage = 1;
-    let totalPages = 1;
-
-    while (currentPage <= totalPages) {
-      const separator = url.includes('?') ? '&' : '?';
-      const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(`${url}${separator}page[number]=${currentPage}&page[size]=${pageSize}`)}`;
-      
-      let retries = 5;
-      let response: Response | undefined;
-      let attempt = 0;
-      
-      while (retries > 0) {
-        try {
-          response = await fetch(proxyUrl, { headers });
-          
-          // Success - break out
-          if (response.ok) break;
-          
-          // Rate limit - use longer backoff
-          if (response.status === 429) {
-            const backoffDelay = Math.min(5000 * Math.pow(2, attempt), 30000);
-            addLog(`Rate limited on ${resourceType} page ${currentPage}, waiting ${(backoffDelay / 1000).toFixed(1)}s...`, 'warning');
-            await new Promise(resolve => setTimeout(resolve, backoffDelay));
-            retries--;
-            attempt++;
-            continue;
-          }
-          
-          // Other error - use exponential backoff
-          const backoffDelay = Math.min(1000 * Math.pow(2, attempt), 10000);
-          addLog(`Retry fetching ${resourceType} page ${currentPage} (${retries} retries left, waiting ${(backoffDelay / 1000).toFixed(1)}s)`, 'warning');
-          retries--;
-          attempt++;
-          await new Promise(resolve => setTimeout(resolve, backoffDelay));
-        } catch (err: any) {
-          const backoffDelay = Math.min(1000 * Math.pow(2, attempt), 10000);
-          addLog(`Network error fetching ${resourceType} page ${currentPage}: ${err.message} (${retries} retries left)`, 'error');
-          retries--;
-          attempt++;
-          if (retries === 0) throw err;
-          await new Promise(resolve => setTimeout(resolve, backoffDelay));
-        }
+  // Cleanup EventSource on unmount
+  useEffect(() => {
+    return () => {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
       }
-
-      if (!response || !response.ok) {
-        const text = await response?.text();
-        throw new Error(`API Error: ${response?.status} ${response?.statusText} - ${text}`);
-      }
-
-      const data = await response.json();
-      const pageData = data.data || [];
-      allData = allData.concat(pageData);
-      totalPages = data.meta?.total_pages || 1;
-      
-      addLog(`Fetched ${resourceType} page ${currentPage}/${totalPages} (${pageData.length} items, ${allData.length} total)`, 'info');
-      
-      currentPage++;
-
-      if (currentPage <= totalPages) {
-        await new Promise(resolve => setTimeout(resolve, 300));
-      }
-    }
-
-    return allData;
-  };
-
-  const fetchTaskComments = async (taskId: string, headers: Record<string, string>): Promise<{ commentsString: string; count: number }> => {
-    try {
-      const baseUrl = `https://api.productive.io/api/v2/comments?filter[task_id]=${taskId}`;
-      const comments = await fetchAllPages(baseUrl, headers, 50, `comments for task ${taskId}`);
-      
-      setProgress(prev => ({ ...prev, commentsProcessed: prev.commentsProcessed + comments.length }));
-
-      if (comments.length === 0) {
-        return { commentsString: '', count: 0 };
-      }
-
-      const commentsString = comments.map(comment => {
-        const timestamp = comment.attributes?.updated_at || comment.attributes?.created_at || '';
-        const body = comment.attributes?.body || '';
-        return `[${timestamp}] ${body}`;
-      }).join(' | ');
-      
-      return { commentsString, count: comments.length };
-    } catch (err: any) {
-      addLog(`Error fetching comments for task ${taskId}: ${err.message}`, 'error');
-      return { commentsString: '', count: 0 };
-    }
-  };
-
-  const fetchTaskCommentsInParallel = async (
-    tasks: any[],
-    headers: Record<string, string>,
-    concurrency = 5
-  ) => {
-    addLog(`Starting parallel comment fetching with ${concurrency} concurrent requests...`, 'info');
-    
-    const tasksWithComments: any[] = [];
-    
-    for (let i = 0; i < tasks.length; i += concurrency) {
-      const chunk = tasks.slice(i, i + concurrency);
-      
-      setProgress(prev => ({ ...prev, activeRequests: chunk.length }));
-      
-      const chunkPromises = chunk.map(async (task) => {
-        const { commentsString, count } = await fetchTaskComments(task.id, headers);
-        return { ...task, comments: commentsString };
-      });
-      
-      const chunkResults = await Promise.all(chunkPromises);
-      tasksWithComments.push(...chunkResults);
-      
-      setProgress(prev => ({ 
-        ...prev, 
-        tasksProcessed: tasksWithComments.length,
-        activeRequests: 0 
-      }));
-      
-      const percentComplete = Math.round((tasksWithComments.length / tasks.length) * 100);
-      addLog(`Progress: ${tasksWithComments.length}/${tasks.length} tasks processed (${percentComplete}%)`, 'success');
-      
-      if (i + concurrency < tasks.length) {
-        await new Promise(resolve => setTimeout(resolve, 300));
-      }
-    }
-    
-    return tasksWithComments;
-  };
+    };
+  }, []);
 
   const handleExport = async () => {
     if (!apiToken || !organizationId || !projectId) {
@@ -190,6 +53,8 @@ export default function Home() {
     setError('');
     setSuccess('');
     setLogs([]);
+    setJobId(null);
+    setJobStatus('');
     
     const exportStartTime = Date.now();
     startTimeRef.current = exportStartTime;
@@ -203,121 +68,65 @@ export default function Home() {
     });
 
     try {
-      addLog('Starting optimized export process...', 'info');
-      const headers = {
-        'X-Auth-Token': apiToken,
-        'X-Organization-Id': organizationId,
-        'Content-Type': 'application/vnd.api+json'
-      };
+      // Start the export job
+      const response = await fetch('/api/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiToken, organizationId, projectId }),
+      });
 
-      addLog(`Fetching tasks for project ${projectId}...`, 'info');
-      const tasks = await fetchAllPages(
-        `https://api.productive.io/api/v2/tasks?filter[project_id]=${projectId}&include=assignee,creator,last_actor,task_list,parent_task,workflow_status`,
-        headers,
-        200,
-        'tasks'
-      );
-
-      setProgress(prev => ({ ...prev, totalTasks: tasks.length }));
-      addLog(`Total tasks found: ${tasks.length}`, 'success');
-
-      if (tasks.length === 0) {
-        addLog('No tasks found for this project', 'error');
-        setError('No tasks found for this project');
-        setLoading(false);
-        return;
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || 'Failed to start export');
       }
 
-      addLog(`Fetching comments using parallel processing (5 concurrent requests)...`, 'info');
-      const tasksWithComments = await fetchTaskCommentsInParallel(tasks, headers, 5);
-      
-      const elapsedTime = ((Date.now() - startTimeRef.current) / 1000).toFixed(1);
-      addLog(`Finished fetching all comments in ${elapsedTime}s!`, 'success');
+      const { jobId: newJobId } = await response.json();
+      setJobId(newJobId);
 
-      addLog('Generating CSV file...', 'info');
-      const csvContent = generateCSV(tasksWithComments);
+      // Connect to SSE stream for real-time updates
+      const eventSource = new EventSource(`/api/export/${newJobId}/stream`);
+      eventSourceRef.current = eventSource;
 
-      addLog('Download ready!', 'success');
-      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-      const link = document.createElement('a');
-      const url = URL.createObjectURL(blob);
-      link.setAttribute('href', url);
-      link.setAttribute('download', `productive_tasks_project_${projectId}_${new Date().toISOString().split('T')[0]}.csv`);
-      link.style.visibility = 'hidden';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
+      eventSource.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        
+        if (data.type === 'init' || data.type === 'update') {
+          const job = data.job;
+          setJobStatus(job.status);
+          setLogs(job.logs);
+          setProgress(job.progress);
 
-      setSuccess(`Successfully exported ${tasks.length} tasks with comments in ${elapsedTime}s!`);
+          if (job.status === 'completed') {
+            const elapsedTime = ((Date.now() - startTimeRef.current) / 1000).toFixed(1);
+            setSuccess(`Export completed in ${elapsedTime}s! Click download to get your CSV file.`);
+            setLoading(false);
+            eventSource.close();
+          } else if (job.status === 'failed') {
+            setError(job.error || 'Export failed');
+            setLoading(false);
+            eventSource.close();
+          }
+        }
+      };
+
+      eventSource.onerror = () => {
+        eventSource.close();
+        if (jobStatus !== 'completed' && jobStatus !== 'failed') {
+          setError('Connection lost. Refresh the page to check status.');
+          setLoading(false);
+        }
+      };
+
     } catch (err: any) {
       console.error('Export error:', err);
-      setError(err.message || 'Failed to export tasks. Please check your credentials and try again.');
-    } finally {
+      setError(err.message || 'Failed to start export. Please check your credentials and try again.');
       setLoading(false);
-      setProgress(prev => ({ ...prev, activeRequests: 0 }));
     }
   };
 
-  const generateCSV = (tasks: any[]) => {
-    const headers = [
-      'Title', 'Task list', 'Status', 'Due date', 'Assignee', 'Last activity',
-      'Creator', 'Date', 'Date closed', 'Date created', 'Dependencies',
-      'Deployment Approved', 'Description', 'Due date & time', 'ID', 'Last actor',
-      'Overdue', 'Parent task', 'Priority', 'Pull Request', 'Pull Request Approved',
-      'Repeat schedule', 'Start date', 'Status', 'Status category', 'Subtask',
-      'Tags', 'Task number', 'Task privacy', 'To-dos', 'Type', 'Comments'
-    ];
-
-    const escapeCSV = (value: any) => {
-      if (value === null || value === undefined) return '';
-      const stringValue = String(value);
-      if (stringValue.includes(',') || stringValue.includes('"') || stringValue.includes('\n')) {
-        return `"${stringValue.replace(/"/g, '""')}"`;
-      }
-      return stringValue;
-    };
-
-    const rows = tasks.map(task => {
-      const attrs = task.attributes || {};
-      const rels = task.relationships || {};
-
-      return [
-        escapeCSV(attrs.title),
-        escapeCSV(rels.task_list?.data?.id || ''),
-        escapeCSV(attrs.closed ? 'Closed' : 'Open'),
-        escapeCSV(attrs.due_date),
-        escapeCSV(rels.assignee?.data?.id || ''),
-        escapeCSV(attrs.last_activity_at),
-        escapeCSV(rels.creator?.data?.id || ''),
-        escapeCSV(attrs.updated_at),
-        escapeCSV(attrs.closed_at),
-        escapeCSV(attrs.created_at),
-        escapeCSV(attrs.task_dependency_count || 0),
-        escapeCSV(''),
-        escapeCSV(attrs.description),
-        escapeCSV(attrs.due_time ? `${attrs.due_date} ${attrs.due_time}` : attrs.due_date),
-        escapeCSV(task.id),
-        escapeCSV(rels.last_actor?.data?.id || ''),
-        escapeCSV(attrs.closed ? 'No' : (attrs.due_date && new Date(attrs.due_date) < new Date() ? 'Yes' : 'No')),
-        escapeCSV(rels.parent_task?.data?.id || ''),
-        escapeCSV(''),
-        escapeCSV(''),
-        escapeCSV(''),
-        escapeCSV(attrs.repeat_schedule_id || ''),
-        escapeCSV(attrs.start_date),
-        escapeCSV(attrs.closed ? 'Closed' : 'Open'),
-        escapeCSV(rels.workflow_status?.data?.id || ''),
-        escapeCSV(attrs.subtask_count || 0),
-        escapeCSV(Array.isArray(attrs.tag_list) ? attrs.tag_list.join('; ') : ''),
-        escapeCSV(attrs.task_number),
-        escapeCSV(attrs.private ? 'Private' : 'Public'),
-        escapeCSV(`${attrs.open_todo_count || 0}/${attrs.todo_count || 0}`),
-        escapeCSV(attrs.type_id === 1 ? 'Task' : 'Milestone'),
-        escapeCSV(task.comments)
-      ].join(',');
-    });
-
-    return [headers.join(','), ...rows].join('\n');
+  const handleDownload = () => {
+    if (!jobId) return;
+    window.location.href = `/api/export/${jobId}/download`;
   };
 
   const progressPercentage = progress.totalTasks > 0 
@@ -344,7 +153,7 @@ export default function Home() {
           </h1>
           <p className="text-lg text-slate-600 flex items-center justify-center gap-2">
             <Zap className="w-5 h-5 text-amber-500" />
-            Optimized for high-speed parallel processing
+            Server-side processing with 120s error recovery
           </p>
         </div>
 
@@ -369,7 +178,7 @@ export default function Home() {
                   value={apiToken}
                   onChange={(e) => setApiToken(e.target.value)}
                   disabled={loading}
-                  className="h-10"
+                  className="h-11"
                 />
               </div>
 
@@ -380,12 +189,11 @@ export default function Home() {
                 <Input
                   id="organizationId"
                   data-testid="input-organization-id"
-                  type="text"
                   placeholder="Enter organization ID"
                   value={organizationId}
                   onChange={(e) => setOrganizationId(e.target.value)}
                   disabled={loading}
-                  className="h-10"
+                  className="h-11"
                 />
               </div>
 
@@ -396,118 +204,145 @@ export default function Home() {
                 <Input
                   id="projectId"
                   data-testid="input-project-id"
-                  type="text"
                   placeholder="Enter project ID"
                   value={projectId}
                   onChange={(e) => setProjectId(e.target.value)}
                   disabled={loading}
-                  className="h-10"
+                  className="h-11"
                 />
               </div>
             </div>
 
-            <Button
-              data-testid="button-export"
-              onClick={handleExport}
-              disabled={loading || !apiToken || !organizationId || !projectId}
-              className="w-full h-10 bg-gradient-to-r from-slate-700 to-slate-900 hover:from-slate-800 hover:to-slate-950 text-white font-medium"
-            >
-              {loading ? (
-                <>
-                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                  Exporting...
-                </>
-              ) : (
-                <>
-                  <Download className="w-4 h-4 mr-2" />
-                  Export Tasks
-                </>
-              )}
-            </Button>
-
             {error && (
-              <Alert variant="destructive" className="border-destructive/50 bg-destructive/10">
+              <Alert variant="destructive" className="border-red-200 bg-red-50">
                 <AlertCircle className="h-4 w-4" />
                 <AlertDescription data-testid="text-error">{error}</AlertDescription>
               </Alert>
             )}
 
             {success && (
-              <Alert className="border-green-500/50 bg-green-50 text-green-900">
-                <CheckCircle2 className="h-4 w-4 text-green-600" />
+              <Alert className="border-green-200 bg-green-50 text-green-900">
+                <CheckCircle2 className="h-4 w-4" />
                 <AlertDescription data-testid="text-success">{success}</AlertDescription>
               </Alert>
             )}
 
-            {loading && progress.totalTasks > 0 && (
-              <div className="space-y-4 p-4 bg-slate-50 rounded-lg border border-slate-200">
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="font-medium text-slate-700">Progress</span>
-                    <span className="font-mono text-slate-900" data-testid="text-progress">
-                      {progress.tasksProcessed}/{progress.totalTasks} tasks ({progressPercentage}%)
-                    </span>
-                  </div>
-                  <Progress value={progressPercentage} className="h-2" />
-                </div>
+            <div className="flex gap-3">
+              <Button
+                onClick={handleExport}
+                disabled={loading || !apiToken || !organizationId || !projectId}
+                className="flex-1 h-11 text-base font-medium"
+                data-testid="button-export"
+              >
+                {loading ? (
+                  <>
+                    <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                    Exporting...
+                  </>
+                ) : (
+                  <>
+                    <FileText className="mr-2 h-5 w-5" />
+                    Start Export
+                  </>
+                )}
+              </Button>
 
-                <div className="grid grid-cols-2 gap-4 text-sm">
-                  <div className="flex items-center gap-2">
-                    <Activity className="w-4 h-4 text-blue-500" />
-                    <span className="text-slate-600">Active requests:</span>
-                    <span className="font-mono font-medium text-slate-900" data-testid="text-active-requests">
-                      {progress.activeRequests}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <CheckCircle2 className="w-4 h-4 text-green-500" />
-                    <span className="text-slate-600">Comments:</span>
-                    <span className="font-mono font-medium text-slate-900">
-                      {progress.commentsProcessed}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-slate-600">Elapsed:</span>
-                    <span className="font-mono font-medium text-slate-900">
-                      {elapsedTime}s
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-slate-600">ETA:</span>
-                    <span className="font-mono font-medium text-slate-900">
-                      ~{estimatedTimeRemaining}s
-                    </span>
-                  </div>
-                </div>
-              </div>
-            )}
+              {jobStatus === 'completed' && jobId && (
+                <Button
+                  onClick={handleDownload}
+                  variant="default"
+                  className="h-11 px-6"
+                  data-testid="button-download"
+                >
+                  <Download className="mr-2 h-4 w-4" />
+                  Download CSV
+                </Button>
+              )}
+            </div>
           </CardContent>
         </Card>
 
+        {loading && (
+          <Card className="shadow-lg border-slate-200/50 bg-white/80 backdrop-blur">
+            <CardHeader className="pb-4">
+              <CardTitle className="text-xl flex items-center gap-2 text-slate-900">
+                <Activity className="w-5 h-5 text-blue-600 animate-pulse" />
+                Export Progress
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              <div className="space-y-3">
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-slate-700 font-medium">Overall Progress</span>
+                  <span className="text-slate-900 font-semibold" data-testid="text-progress-percentage">
+                    {progressPercentage}%
+                  </span>
+                </div>
+                <Progress value={progressPercentage} className="h-3" />
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div className="bg-slate-50 rounded-lg p-4 border border-slate-200">
+                  <div className="text-sm text-slate-600 mb-1">Tasks Processed</div>
+                  <div className="text-2xl font-bold text-slate-900" data-testid="text-tasks-processed">
+                    {progress.tasksProcessed}/{progress.totalTasks}
+                  </div>
+                </div>
+                <div className="bg-blue-50 rounded-lg p-4 border border-blue-200">
+                  <div className="text-sm text-blue-700 mb-1">Comments Fetched</div>
+                  <div className="text-2xl font-bold text-blue-900" data-testid="text-comments-fetched">
+                    {progress.commentsProcessed}
+                  </div>
+                </div>
+                <div className="bg-amber-50 rounded-lg p-4 border border-amber-200">
+                  <div className="text-sm text-amber-700 mb-1">Active Requests</div>
+                  <div className="text-2xl font-bold text-amber-900" data-testid="text-active-requests">
+                    {progress.activeRequests}
+                  </div>
+                </div>
+                <div className="bg-green-50 rounded-lg p-4 border border-green-200">
+                  <div className="text-sm text-green-700 mb-1">Time Elapsed</div>
+                  <div className="text-2xl font-bold text-green-900" data-testid="text-elapsed-time">
+                    {elapsedTime}s
+                  </div>
+                </div>
+              </div>
+
+              {progress.totalTasks > 0 && progress.tasksProcessed < progress.totalTasks && (
+                <div className="text-center">
+                  <div className="text-sm text-slate-600">
+                    Estimated time remaining: <span className="font-semibold text-slate-900">{estimatedTimeRemaining}s</span>
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        )}
+
         {logs.length > 0 && (
-          <Card className="shadow-xl border-slate-200/50 bg-white/80 backdrop-blur">
-            <CardHeader>
-              <CardTitle className="text-xl text-slate-900">Export Log</CardTitle>
-              <CardDescription className="text-sm text-slate-600">
-                Real-time processing activity
-              </CardDescription>
+          <Card className="shadow-lg border-slate-200/50 bg-white/80 backdrop-blur">
+            <CardHeader className="pb-4">
+              <CardTitle className="text-xl text-slate-900">Activity Log</CardTitle>
+              <CardDescription>Real-time export progress and status updates</CardDescription>
             </CardHeader>
             <CardContent>
-              <div 
-                className="max-h-96 overflow-y-auto space-y-1 p-4 bg-slate-950 rounded-md font-mono text-xs"
-                data-testid="container-logs"
-              >
+              <div className="bg-slate-900 rounded-lg p-4 max-h-96 overflow-y-auto font-mono text-sm">
                 {logs.map((log, index) => (
                   <div
                     key={index}
-                    className={`${
-                      log.type === 'success' ? 'text-green-400' :
-                      log.type === 'error' ? 'text-red-400' :
-                      log.type === 'warning' ? 'text-amber-400' :
-                      'text-slate-300'
+                    className={`py-1 ${
+                      log.type === 'error'
+                        ? 'text-red-400'
+                        : log.type === 'warning'
+                        ? 'text-yellow-400'
+                        : log.type === 'success'
+                        ? 'text-green-400'
+                        : 'text-slate-300'
                     }`}
+                    data-testid={`log-entry-${index}`}
                   >
-                    <span className="text-slate-500">[{log.timestamp}]</span> {log.message}
+                    <span className="text-slate-500">[{log.timestamp}]</span>{' '}
+                    {log.message}
                   </div>
                 ))}
                 <div ref={logsEndRef} />
