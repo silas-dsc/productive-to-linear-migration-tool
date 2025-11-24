@@ -98,9 +98,13 @@ export default function Home() {
 
           if (job.status === 'completed') {
             const elapsedTime = ((Date.now() - startTimeRef.current) / 1000).toFixed(1);
-            setSuccess(`Export completed in ${elapsedTime}s! Click download to get your CSV file.`);
+            setSuccess(`Export completed in ${elapsedTime}s! Downloading...`);
             setLoading(false);
             eventSource.close();
+            // Auto-download the CSV file
+            setTimeout(() => {
+              window.location.href = `/api/export/${newJobId}/download`;
+            }, 500);
           } else if (job.status === 'failed') {
             setError(job.error || 'Export failed');
             setLoading(false);
@@ -227,38 +231,24 @@ export default function Home() {
               </Alert>
             )}
 
-            <div className="flex gap-3">
-              <Button
-                onClick={handleExport}
-                disabled={loading || !apiToken || !organizationId || !projectId}
-                className="flex-1 h-11 text-base font-medium"
-                data-testid="button-export"
-              >
-                {loading ? (
-                  <>
-                    <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-                    Exporting...
-                  </>
-                ) : (
-                  <>
-                    <FileText className="mr-2 h-5 w-5" />
-                    Start Export
-                  </>
-                )}
-              </Button>
-
-              {jobStatus === 'completed' && jobId && (
-                <Button
-                  onClick={handleDownload}
-                  variant="default"
-                  className="h-11 px-6"
-                  data-testid="button-download"
-                >
-                  <Download className="mr-2 h-4 w-4" />
-                  Download CSV
-                </Button>
+            <Button
+              onClick={handleExport}
+              disabled={loading || !apiToken || !organizationId || !projectId}
+              className="w-full h-11 text-base font-medium"
+              data-testid="button-export"
+            >
+              {loading ? (
+                <>
+                  <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                  Exporting...
+                </>
+              ) : (
+                <>
+                  <FileText className="mr-2 h-5 w-5" />
+                  Start Export
+                </>
               )}
-            </div>
+            </Button>
           </CardContent>
         </Card>
 
