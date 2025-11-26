@@ -9,9 +9,16 @@ import { Download, FileText, Loader2, CheckCircle2, AlertCircle, Zap, Activity }
 import type { LogEntry, ProgressStats } from '@shared/schema';
 
 export default function Home() {
+  // Initialize with empty state
   const [apiToken, setApiToken] = useState('');
   const [organizationId, setOrganizationId] = useState('');
   const [projectId, setProjectId] = useState('');
+  const [importToLinear, setImportToLinear] = useState(false);
+  const [linearTeamId, setLinearTeamId] = useState('');
+  const [linearApiKey, setLinearApiKey] = useState('');
+  const [testMode, setTestMode] = useState(false);
+  const [skipDuplicateCheck, setSkipDuplicateCheck] = useState(false);
+  const [onlyNotDoneTasks, setOnlyNotDoneTasks] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
@@ -30,6 +37,107 @@ export default function Home() {
   const startTimeRef = useRef<number>(0);
   const eventSourceRef = useRef<EventSource | null>(null);
 
+  const reconnectToJob = async (jobId: string) => {
+    try {
+      // Check if job still exists and get its current status
+      const response = await fetch(`/api/export/${jobId}/status`);
+      if (!response.ok) {
+        if (response.status === 404) {
+          // Job not found, clear localStorage
+          localStorage.removeItem('productive-export-job-id');
+          return;
+        }
+        throw new Error('Failed to check job status');
+      }
+
+      const job = await response.json();
+      setJobId(jobId);
+      setJobStatus(job.status);
+      setLogs(job.logs);
+      setProgress(job.progress);
+
+      if (job.status === 'completed') {
+        setSuccess('Export completed! You can download the CSV file below.');
+        localStorage.removeItem('productive-export-job-id');
+        return;
+      } else if (job.status === 'failed') {
+        setError(job.error || 'Export failed');
+        localStorage.removeItem('productive-export-job-id');
+        return;
+      }
+
+      // Job is still running, reconnect to SSE
+      setLoading(true);
+      setError('');
+      setSuccess('');
+
+      const eventSource = new EventSource(`/api/export/${jobId}/stream`);
+      eventSourceRef.current = eventSource;
+
+      eventSource.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        
+        if (data.type === 'init' || data.type === 'update') {
+          const currentJob = data.job;
+          setJobStatus(currentJob.status);
+          setLogs(currentJob.logs);
+          setProgress(currentJob.progress);
+
+          if (currentJob.status === 'completed') {
+            setSuccess('Export completed! You can download the CSV file below.');
+            setLoading(false);
+            eventSource.close();
+            localStorage.removeItem('productive-export-job-id');
+          } else if (currentJob.status === 'failed') {
+            setError(currentJob.error || 'Export failed');
+            setLoading(false);
+            eventSource.close();
+            localStorage.removeItem('productive-export-job-id');
+          }
+        }
+      };
+
+      eventSource.onerror = (error) => {
+        console.error('SSE reconnection error:', error);
+        eventSource.close();
+        // Don't clear loading state here - job might still be running
+        setError('Connection lost. The export may still be running in the background.');
+      };
+
+    } catch (err: any) {
+      console.error('Failed to reconnect to job:', err);
+      localStorage.removeItem('productive-export-job-id');
+      setError('Failed to reconnect to previous export job.');
+    }
+  };
+
+  // Load environment variables and check for existing job on mount
+  useEffect(() => {
+    console.log('Loading environment variables...', {
+      VITE_PRODUCTIVE_API_TOKEN: import.meta.env.VITE_PRODUCTIVE_API_TOKEN ? '***' : 'NOT SET',
+      VITE_PRODUCTIVE_ORG_ID: import.meta.env.VITE_PRODUCTIVE_ORG_ID,
+      VITE_PRODUCTIVE_PROJECT_ID: import.meta.env.VITE_PRODUCTIVE_PROJECT_ID,
+      VITE_LINEAR_TEAM_ID: import.meta.env.VITE_LINEAR_TEAM_ID,
+      VITE_LINEAR_API_KEY: import.meta.env.VITE_LINEAR_API_KEY ? '***' : 'NOT SET',
+      VITE_IMPORT_TO_LINEAR: import.meta.env.VITE_IMPORT_TO_LINEAR,
+    });
+    
+    setApiToken(import.meta.env.VITE_PRODUCTIVE_API_TOKEN || '');
+    setOrganizationId(import.meta.env.VITE_PRODUCTIVE_ORG_ID || '');
+    setProjectId(import.meta.env.VITE_PRODUCTIVE_PROJECT_ID || '');
+    setImportToLinear(import.meta.env.VITE_IMPORT_TO_LINEAR === 'true' || false);
+    setLinearTeamId(import.meta.env.VITE_LINEAR_TEAM_ID || '');
+    setLinearApiKey(import.meta.env.VITE_LINEAR_API_KEY || '');
+    setTestMode(import.meta.env.VITE_TEST_MODE === 'true' || false);
+
+    // Check for existing running job
+    const existingJobId = localStorage.getItem('productive-export-job-id');
+    if (existingJobId) {
+      console.log('Found existing job ID:', existingJobId);
+      reconnectToJob(existingJobId);
+    }
+  }, []);
+
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
@@ -43,9 +151,24 @@ export default function Home() {
     };
   }, []);
 
+  const handleStop = async () => {
+    if (!jobId) return;
+    try {
+      await fetch(`/api/export/${jobId}/stop`, { method: 'POST' });
+      setLoading(false);
+    } catch (err) {
+      console.error('Failed to stop export:', err);
+    }
+  };
+
   const handleExport = async () => {
     if (!apiToken || !organizationId || !projectId) {
       setError('Please fill in all fields');
+      return;
+    }
+
+    if (importToLinear && !linearTeamId) {
+      setError('Linear team id is required when importing to Linear');
       return;
     }
 
@@ -72,7 +195,17 @@ export default function Home() {
       const response = await fetch('/api/export', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ apiToken, organizationId, projectId }),
+        body: JSON.stringify({ 
+          apiToken, 
+            organizationId, 
+            projectId, 
+            importToLinear, 
+            linearTeamId,
+            linearApiKey,
+            testMode,
+            skipDuplicateCheck,
+            onlyNotDoneTasks,
+        }),
       });
 
       if (!response.ok) {
@@ -153,67 +286,172 @@ export default function Home() {
             <FileText className="w-8 h-8 text-white" />
           </div>
           <h1 className="text-4xl font-bold text-slate-900 tracking-tight">
-            Productive Task Exporter
+            Productive to Linear Importer
           </h1>
           <p className="text-lg text-slate-600 flex items-center justify-center gap-2">
             <Zap className="w-5 h-5 text-amber-500" />
-            Server-side processing with 120s error recovery
+            Export Productive tasks and import to Linear
           </p>
         </div>
 
         <Card className="shadow-xl border-slate-200/50 bg-white/80 backdrop-blur">
           <CardHeader className="space-y-2 pb-6">
-            <CardTitle className="text-2xl text-slate-900">Export Configuration</CardTitle>
+            <CardTitle className="text-2xl text-slate-900">Configuration</CardTitle>
             <CardDescription className="text-base text-slate-600">
-              Enter your Productive API credentials and project details
+              Enter your Productive and Jira credentials
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
             <div className="space-y-4">
-              <div className="space-y-2">
-                <Label htmlFor="apiToken" className="text-sm font-medium text-slate-700">
-                  API Token
-                </Label>
-                <Input
-                  id="apiToken"
-                  data-testid="input-api-token"
-                  type="password"
-                  placeholder="Enter your API token"
-                  value={apiToken}
-                  onChange={(e) => setApiToken(e.target.value)}
-                  disabled={loading}
-                  className="h-11"
-                />
+              <div className="space-y-3">
+                <h3 className="font-semibold text-slate-700">Productive.io Credentials</h3>
+                <div className="space-y-2">
+                  <Label htmlFor="apiToken" className="text-sm font-medium text-slate-700">
+                    API Token
+                  </Label>
+                  <Input
+                    id="apiToken"
+                    data-testid="input-api-token"
+                    type="password"
+                    placeholder="Enter your Productive API token"
+                    value={apiToken}
+                    onChange={(e) => setApiToken(e.target.value)}
+                    disabled={loading}
+                    className="h-11"
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="organizationId" className="text-sm font-medium text-slate-700">
+                    Organization ID
+                  </Label>
+                  <Input
+                    id="organizationId"
+                    data-testid="input-organization-id"
+                    placeholder="Enter organization ID"
+                    value={organizationId}
+                    onChange={(e) => setOrganizationId(e.target.value)}
+                    disabled={loading}
+                    className="h-11"
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="projectId" className="text-sm font-medium text-slate-700">
+                    Project ID
+                  </Label>
+                  <Input
+                    id="projectId"
+                    data-testid="input-project-id"
+                    placeholder="Enter project ID"
+                    value={projectId}
+                    onChange={(e) => setProjectId(e.target.value)}
+                    disabled={loading}
+                    className="h-11"
+                  />
+                </div>
               </div>
 
-              <div className="space-y-2">
-                <Label htmlFor="organizationId" className="text-sm font-medium text-slate-700">
-                  Organization ID
-                </Label>
-                <Input
-                  id="organizationId"
-                  data-testid="input-organization-id"
-                  placeholder="Enter organization ID"
-                  value={organizationId}
-                  onChange={(e) => setOrganizationId(e.target.value)}
-                  disabled={loading}
-                  className="h-11"
-                />
-              </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="projectId" className="text-sm font-medium text-slate-700">
-                  Project ID
-                </Label>
-                <Input
-                  id="projectId"
-                  data-testid="input-project-id"
-                  placeholder="Enter project ID"
-                  value={projectId}
-                  onChange={(e) => setProjectId(e.target.value)}
-                  disabled={loading}
-                  className="h-11"
-                />
+              <div className="border-t pt-4">
+                <div className="space-y-3">
+                  <h3 className="font-semibold text-slate-700">Linear Import Credentials</h3>
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <input
+                        id="importToLinear"
+                        data-testid="checkbox-import-linear"
+                        type="checkbox"
+                        checked={importToLinear}
+                        onChange={(e) => setImportToLinear(e.target.checked)}
+                        disabled={loading}
+                        className="w-4 h-4"
+                      />
+                      <Label htmlFor="importToLinear" className="text-sm font-medium text-slate-700 cursor-pointer">
+                        Import tasks to Linear
+                      </Label>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <input
+                        id="testMode"
+                        data-testid="checkbox-test-mode"
+                        type="checkbox"
+                        checked={testMode}
+                        onChange={(e) => setTestMode(e.target.checked)}
+                        disabled={loading}
+                        className="w-4 h-4"
+                      />
+                      <Label htmlFor="testMode" className="text-sm font-medium text-slate-700 cursor-pointer">
+                        Test mode (first 3 tasks only)
+                      </Label>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <input
+                        id="skipDuplicateCheck"
+                        data-testid="checkbox-skip-duplicate-check"
+                        type="checkbox"
+                        checked={skipDuplicateCheck}
+                        onChange={(e) => setSkipDuplicateCheck(e.target.checked)}
+                        disabled={loading}
+                        className="w-4 h-4"
+                      />
+                      <Label htmlFor="skipDuplicateCheck" className="text-sm font-medium text-slate-700 cursor-pointer">
+                        Skip duplicate check (faster import)
+                      </Label>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <input
+                        id="onlyNotDoneTasks"
+                        data-testid="checkbox-only-not-done"
+                        type="checkbox"
+                        checked={onlyNotDoneTasks}
+                        onChange={(e) => setOnlyNotDoneTasks(e.target.checked)}
+                        disabled={loading}
+                        className="w-4 h-4"
+                      />
+                      <Label htmlFor="onlyNotDoneTasks" className="text-sm font-medium text-slate-700 cursor-pointer">
+                        Only import "not done" tasks (exclude completed/cancelled)
+                      </Label>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="linearTeamId" className="text-sm font-medium text-slate-700">
+                      Linear Team ID
+                    </Label>
+                    <Input
+                      id="linearTeamId"
+                      data-testid="input-linear-team-id"
+                      placeholder="Linear team ID"
+                      value={linearTeamId}
+                      onChange={(e) => setLinearTeamId(e.target.value)}
+                      disabled={loading}
+                      className="h-11"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="linearApiKey" className="text-sm font-medium text-slate-700">
+                      Linear API Key
+                    </Label>
+                    <Input
+                      id="linearApiKey"
+                      data-testid="input-linear-api-key"
+                      type="password"
+                      placeholder="Your Linear API key"
+                      value={linearApiKey}
+                      onChange={(e) => setLinearApiKey(e.target.value)}
+                      disabled={loading}
+                      className="h-11"
+                    />
+                    <p className="text-xs text-slate-500">
+                      Get an API key from <a href="https://linear.app/settings/api" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">Linear settings</a>
+                    </p>
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -231,24 +469,36 @@ export default function Home() {
               </Alert>
             )}
 
-            <Button
-              onClick={handleExport}
-              disabled={loading || !apiToken || !organizationId || !projectId}
-              className="w-full h-11 text-base font-medium"
-              data-testid="button-export"
-            >
-              {loading ? (
-                <>
-                  <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-                  Exporting...
-                </>
-              ) : (
-                <>
-                  <FileText className="mr-2 h-5 w-5" />
-                  Start Export
-                </>
+            <div className="flex gap-3">
+              <Button
+                onClick={handleExport}
+                disabled={loading || !apiToken || !organizationId || !projectId}
+                className="flex-1 h-11 text-base font-medium"
+                data-testid="button-export"
+              >
+                {loading ? (
+                  <>
+                    <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                    Exporting...
+                  </>
+                ) : (
+                  <>
+                    <FileText className="mr-2 h-5 w-5" />
+                    Start Export
+                  </>
+                )}
+              </Button>
+              {loading && (
+                <Button
+                  onClick={handleStop}
+                  variant="destructive"
+                  className="h-11 px-6"
+                  data-testid="button-stop"
+                >
+                  Stop
+                </Button>
               )}
-            </Button>
+            </div>
           </CardContent>
         </Card>
 

@@ -3,4 +3,9 @@ dist
 .DS_Store
 server/public
 vite.config.ts.*
-*.tar.gz
+.env
+.env.local
+.local
+.vscode
+client/.env
+client/.env.local

@@ -2,9 +2,10 @@ import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { createExportJobSchema } from "@shared/schema";
-import type { ExportJob } from "@shared/schema";
-import { createJob, getJob, updateJob } from "./job-storage";
+import type { ExportJob, ExportJobWithLinear } from "@shared/schema";
+import { createJob, getJob, updateJob, stopJob } from "./job-storage";
 import { processExportJob } from "./export-worker";
+import { testLinearAuth } from "./linear-client";
 import { randomBytes } from "crypto";
 
 export async function registerRoutes(app: Express): Promise<Server> {
@@ -13,13 +14,36 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const validatedData = createExportJobSchema.parse(req.body);
       
+      // Debug logging
+      console.log('Export request received:', {
+        importToLinear: validatedData.importToLinear,
+        linearApiKey: validatedData.linearApiKey ? '***' : 'NOT SET',
+        linearTeamId: validatedData.linearTeamId,
+      });
+      
+      // Additional validation for Linear import
+      if (validatedData.importToLinear) {
+        if (!validatedData.linearApiKey) {
+          throw new Error('Linear API key is required when importing to Linear');
+        }
+        if (!validatedData.linearTeamId) {
+          throw new Error('Linear team ID is required when importing to Linear');
+        }
+      }
+      
       const jobId = randomBytes(16).toString('hex');
-      const job: ExportJob = {
+      const job: ExportJobWithLinear = {
         id: jobId,
         status: 'pending',
         apiToken: validatedData.apiToken,
         organizationId: validatedData.organizationId,
         projectId: validatedData.projectId,
+        linearTeamId: validatedData.linearTeamId,
+        importToLinear: validatedData.importToLinear,
+        linearApiKey: validatedData.linearApiKey,
+        skipDuplicateCheck: validatedData.skipDuplicateCheck,
+        onlyNotDoneTasks: validatedData.onlyNotDoneTasks,
+        testMode: validatedData.testMode,
         logs: [],
         progress: {
           tasksProcessed: 0,
@@ -128,6 +152,30 @@ export async function registerRoutes(app: Express): Promise<Server> {
     });
   });
 
+  // POST /api/linear/test - Validate Linear API key
+  app.post('/api/linear/test', async (req, res) => {
+    const { linearApiKey } = req.body || {};
+
+    if (!linearApiKey) {
+      res.status(400).json({ authenticated: false, error: 'linearApiKey is required in the request body' });
+      return;
+    }
+
+    try {
+      const result = await testLinearAuth(linearApiKey);
+      res.json(result);
+    } catch (err: any) {
+      res.status(400).json({ authenticated: false, error: err.message || String(err) });
+    }
+  });
+
+  // POST /api/export/:jobId/stop - Stop an export job
+  app.post('/api/export/:jobId/stop', (req, res) => {
+    const { jobId } = req.params;
+    stopJob(jobId);
+    res.json({ success: true });
+  });
+
   // GET /api/export/:jobId/download - Download the CSV file
   app.get('/api/export/:jobId/download', (req, res) => {
     const { jobId } = req.params;
@@ -145,7 +193,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
     const filename = `productive_tasks_project_${job.projectId}_${new Date().toISOString().split('T')[0]}.csv`;
     
-    res.setHeader('Content-Type', 'text/csv;charset=utf-8;');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.send(job.csvData);
   });

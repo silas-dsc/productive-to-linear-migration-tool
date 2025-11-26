@@ -27,12 +27,20 @@ export function getAllJobs(): ExportJob[] {
   return Array.from(jobs.values());
 }
 
-// Clean up old jobs (older than 1 hour)
+export function stopJob(id: string): void {
+  const job = jobs.get(id);
+  if (job) {
+    (job as any).shouldStop = true;
+    jobs.set(id, job);
+  }
+}
+
+// Clean up old jobs (older than 24 hours) or stopped jobs
 setInterval(() => {
-  const oneHourAgo = Date.now() - 3600000;
+  const twentyFourHoursAgo = Date.now() - 86400000; // 24 hours in milliseconds
   const entries = Array.from(jobs.entries());
   for (const [id, job] of entries) {
-    if (job.createdAt < oneHourAgo) {
+    if (job.createdAt < twentyFourHoursAgo || (job as any).shouldStop) {
       jobs.delete(id);
     }
   }

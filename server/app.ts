@@ -8,6 +8,7 @@ import express, {
 } from "express";
 
 import { registerRoutes } from "./routes";
+import { execSync } from 'node:child_process';
 
 export function log(message: string, source = "express") {
   const formattedTime = new Date().toLocaleTimeString("en-US", {
@@ -85,12 +86,71 @@ export default async function runApp(
   // Other ports are firewalled. Default to 5000 if not specified.
   // this serves both the API and the client.
   // It is the only port that is not firewalled.
-  const port = parseInt(process.env.PORT || '5000', 10);
-  server.listen({
-    port,
-    host: "0.0.0.0",
-    reusePort: true,
-  }, () => {
-    log(`serving on port ${port}`);
-  });
+  const basePort = parseInt(process.env.PORT || '5000', 10);
+
+  const MAX_ATTEMPTS = 5;
+
+  const autoKill = String(process.env.AUTO_KILL_PORT || '').toLowerCase() === '1' || String(process.env.AUTO_KILL_PORT || '').toLowerCase() === 'true';
+
+  function findPidsListeningOn(portNum: number): number[] {
+    try {
+      const out = execSync(`lsof -ti tcp:${portNum}`, { stdio: ['pipe', 'pipe', 'ignore'] }).toString();
+      return out.split(/\s+/).filter(Boolean).map(s => parseInt(s, 10)).filter(Boolean);
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function tryListen(port: number, attemptsLeft: number, triedKill = false) {
+    // Remove previous error listeners to avoid memory leaks for repeated tries
+    server.removeAllListeners('error');
+
+    server.once('error', (err: any) => {
+      if (err && (err as any).code === 'EADDRINUSE') {
+        log(`port ${port} already in use`, 'server');
+
+        if (attemptsLeft > 0) {
+          const nextPort = port + 1;
+          log(`trying next port ${nextPort} (${attemptsLeft} attempts left)`, 'server');
+          setTimeout(() => tryListen(nextPort, attemptsLeft - 1, triedKill), 200);
+          return;
+        }
+
+        const pids = findPidsListeningOn(port);
+        if (pids.length > 0) {
+          log(`found process(es) listening on ${port}: ${pids.join(', ')}`, 'server');
+
+          if (autoKill && !triedKill) {
+            try {
+              for (const pid of pids) {
+                log(`killing PID ${pid} (AUTO_KILL_PORT enabled)`, 'server');
+                execSync(`kill -9 ${pid}`);
+              }
+              // After killing, give the OS a moment to free the socket
+              setTimeout(() => tryListen(port, 0, true), 300);
+              return;
+            } catch (killErr: any) {
+              log(`failed to kill process: ${killErr?.message || killErr}`, 'server');
+            }
+          }
+
+          log(`To free the port run: lsof -ti tcp:${port} | xargs kill -9`, 'server');
+        } else {
+          log(`port ${port} appears in use but no PID found via lsof`, 'server');
+        }
+
+        log(`failed to bind after trying ports starting at ${basePort}`, 'server');
+        process.exit(1);
+      } else {
+        log(`server error: ${(err && err.message) || err}`, 'server');
+        throw err;
+      }
+    });
+
+    server.listen({ port, host: '0.0.0.0', reusePort: true }, () => {
+      log(`serving on port ${port}`);
+    });
+  }
+
+  tryListen(basePort, MAX_ATTEMPTS - 1);
 }

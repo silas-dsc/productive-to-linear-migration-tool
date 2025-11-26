@@ -52,6 +52,23 @@ export const createExportJobSchema = z.object({
   apiToken: z.string().min(1, 'API token is required'),
   organizationId: z.string().min(1, 'Organization ID is required'),
   projectId: z.string().min(1, 'Project ID is required'),
+  importToLinear: z.boolean().optional().default(false),
+  linearTeamId: z.string().optional(),
+  linearApiKey: z.string().optional(),
+  testMode: z.boolean().optional().default(false),
+  skipDuplicateCheck: z.boolean().optional().default(false),
+  onlyNotDoneTasks: z.boolean().optional().default(false),
 });
 
 export type CreateExportJob = z.infer<typeof createExportJobSchema>;
+
+export interface ExportJobWithLinear extends ExportJob {
+  importToLinear?: boolean;
+  linearTeamId?: string;
+  linearApiKey?: string;
+  linearIssuesCreated?: number;
+  shouldStop?: boolean;
+  testMode?: boolean;
+  skipDuplicateCheck?: boolean;
+  onlyNotDoneTasks?: boolean;
+}
