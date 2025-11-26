@@ -70,7 +70,7 @@ You can also enter these values in the web UI when starting an export job.
 - For rate limits, the tool will automatically wait and retry.
 
 ## Advanced
-- To change the port, set `PORT=xxxx` in your `.env.local`.
+- To change the port, set `PORT=xxxx` in your `.env` files.
 - For custom builds, see `package.json` scripts.
 
 ## License
